@@ -1,0 +1,1 @@
+[${context.jurisdictionName} - Request #${context.serviceRequestPublicId}]: Your Service Request Has Been Closed

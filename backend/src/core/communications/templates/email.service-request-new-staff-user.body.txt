@@ -1,0 +1,9 @@
+Hello ${context.recipientName},
+<br />
+<br />
+A new service request has been submitted, number #${context.serviceRequestPublicId}.
+<br />
+<br />
+Further information is available in ${context.appName} here: <a href="${context.appRequestUrl}">Request #${context.serviceRequestPublicId}</a>.
+<br />
+<br />

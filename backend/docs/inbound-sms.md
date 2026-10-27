@@ -1,0 +1,63 @@
+# Inbound SMS
+
+Nepal Civic supports multiple "inbound channels" for service requests. The basic inbound channel is submitting data via a POST request, as generally done from a web form (and, we call this channel `webform` in the data model (ref.)).
+
+Nepal Civic also supports SMS as a channel for service requests, and in this implementation, an SMS can be sent to a special email address, and in turn, data from that email gets sent to Nepal Civic, processed, and turned into a service request. There are several aspects of this integration to create structured data out of an SMS, and here we will go over all the details.
+
+## Configure a Twilio Number for the Nepal Civic instance
+
+At the level of the Nepal Civic instance (the server), we need one Twilio Number configured, and set at `TWILIO_FROM_PHONE`.
+
+This number is used to emit SMS messages for Service Request submissions as a fallback, and irregardless of whether a given Jurisdiction has opted in to Inbound SMS ot Two-way SMS. Think if it like `webmaster@localhost` for SMS in Nepal Civic.
+
+This number needs to be configured to send messages (default when you acquire a Twilio Number), and also it is highly recommended to provide an autoresponder from this number so if anyone attempts to respond back to an SMS, it is clear that it is a "no reply" number. This number will belong to a Twilio Messaging Service, you should name a your messaging service and associate all numbers with it. Set the messaging service as `TWILIO_MESSAGE_SERVICE_SID`.
+
+The core configuration for Twilio is to set `TWILIO_ACCOUNT_SID `, `TWILIO_MESSAGE_SERVICE_SID`, and `TWILIO_AUTH_TOKEN` with valid credentials from a Twilio account, in order to interact with Twilio.
+
+### Set up an auto response with Studio Flow
+
+[Studio Flow](https://console.twilio.com/us1/develop/studio?frameUrl=%2Fconsole%2Fstudio%2Fdashboard%3Fx-target-region%3Dus1) is Twilio's UI for creating logic around events in there system. We can use it to set an auto response on our Nepal Civic instance number.
+
+- Create a new flow (e.g.: called "Nepal Civic Instance Auto Response")
+- Choose the "Message Auto Responder" template
+- When the editor opens up, it creates a widget with a default name and message body. Edit it as desired. (e.g: "This number does not accept replies. Please contact the Jursidiction where you submitted your request directly.")
+- After you save your widget, click on the "trigger" component, and then, on the right had side edit panel, you will see a link "Using this flow with a Phoen Number". Click that link and follow the stesp to associate it with your Nepal Civic Instance Number
+- Click on the Twilio Number that is your instance number, go down to messaging, and change "A Message Comes in" to Studio Flow and select to Flow you just created.
+- Now, this number will be used for sending system messages, but if anyone tries to respond to such messages, they will receive a response back "This number does not accept replies. Please contact the Jursidiction where you submitted your request directly."
+
+## Configure a Twilio Number for a Jurisidiction
+
+Ok, so now with the basics of what the Nepal Civic server needs done, we can move onto Jurisdiction-level Twilio Number configuration for inbound SMS.
+
+As a reminder, the core configuration for Twilio is to set `TWILIO_ACCOUNT_SID `, `TWILIO_MESSAGE_SERVICE_SID`, and `TWILIO_AUTH_TOKEN` with valid credentials from a Twilio account.
+
+### Create a general number for the Jursidiction
+
+The Twilio setup steps are:
+
+- Create a new number, and give it a friendly name (e.g.: "Nepal Civic Demo")
+- **Optional**: If this number will never be used for incoming service requests, you can also set this number up with a "no reply" auto response as we did with the instance-level number.
+  - In this case, it is recommended to create a generic "jursidiction no reply" response. You can do that by duplicating the "Nepal Civic Instance Auto Response" we created above, call it "Nepal Civic Jurisdiction No Reply" and write your message. You can then attach all Jurisdiction Numbers that are not used for Inbound Requests to this by default, and, only change that if (i) a Jurisdiction wants a custom message, or (ii), the **common case**, the Number will **also** be used for inbound requests (next step), and (iii) the **common case**, `Jurisdiction.replyToServiceRequestEnabled` is true, meaning that two-way communication will be managed via this Number.
+
+Configure this number in Nepal Civic:
+
+- `Jurisdiction.sendFromPhone` - This needs to be set with the new number. When this is set, outgoing messages for the jurisdiction will be sent from this number rather than `TWILIO_FROM_PHONE`.
+
+### Create an Inbound Map record to receive inbound SMS
+
+Next, we need to configure the use of a Number for inbound requests:
+
+- Follow the same steps as "Create a general number for the Jursidiction" without the auto reply, or **recommended** use that same number without the auto reply.
+- Creating a new `InboundMap` record to route incoming SMS from this number to the correct Jurisdiction (this is the equivalent of how InboundMap is used for [Inbound Email](./inbound-email.md)).
+  - Note that we **don't** simply use `Jurisdiction.sendFromPhone` because it is possible to create any number of InboundMap records with different Twilio Numbers and/or with different rules. However, the happy path for small Jurisdictions will be to simply create a single InboundMap record associating the Twilio Number and the Jurisdiction, and have all inbound requests come via it.
+
+```http
+POST {{ host }}/communications/create-map?jurisdictionId={{ jurisdictionId }}
+content-type: application/json
+
+{
+    "jurisdictionId": "{{ jurisdictionId }}",
+    "channel": "sms",
+    "id": "+1-111-11111"
+}
+```

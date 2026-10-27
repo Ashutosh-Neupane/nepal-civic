@@ -1,0 +1,503 @@
+import chai from 'chai';
+import type { Application } from 'express';
+import _ from 'lodash';
+import { createApp } from '../src';
+import { initConfig } from '../src/config';
+import { dispatchMessage, getReplyToEmail, getSendFromEmail, getSendFromPhone, loadTemplate, makeRequestURL, makeSendAtDate, setDispatchChannel } from '../src/core/communications/helpers';
+import { OutboundMessageService } from '../src/core/communications/services';
+import { SERVICE_REQUEST_CLOSED_STATES } from '../src/core/service-requests';
+import { sendEmail } from '../src/email';
+import { normalizeNepaliPhone, sendSms } from '../src/sms';
+import makeTestData, { writeTestDataToDatabase } from '../src/tools/fake-data-generator';
+import type { AppConfig, CommunicationAttributes, CommunicationTemplateNames, StaffUserAttributes, TemplateConfigContextAttributes, TestDataPayload } from '../src/types';
+
+describe('Verify Core Communications Functionality.', function () {
+  let app: Application;
+  let testData: TestDataPayload;
+
+  before(async function () {
+    process.env.COMMUNICATIONS_TO_CONSOLE = 'true';
+    process.env.TEST_TO_EMAIL = 'example@example.com';
+    process.env.TEST_TO_PHONE = '+1 111 111 111';
+    app = await createApp();
+    await app.migrator.up();
+    testData = makeTestData();
+    await writeTestDataToDatabase(app.database, testData);
+  })
+
+  after(async function () {
+    await app.database.drop({});
+  })
+
+  it('should send email', async function () {
+    const config = await initConfig();
+    const { sendGridApiKey } = config as AppConfig;
+    const sendAt = new Date();
+    const response = await sendEmail(
+      sendGridApiKey as string,
+      'example@example.com',
+      'example@example.com',
+      'example@example.com', // replyTo
+      'Test subject line',
+      'Test <strong>html</strong> body',
+      'Test text body',
+      sendAt,
+    );
+    chai.assert(response);
+  });
+
+  it('should send email with valid sendAt: future', async function () {
+    const config = await initConfig();
+    const { sendGridApiKey } = config as AppConfig;
+    const referenceDate = new Date();
+    const fakeBroadcastWindow = 10;
+    const sendAt = makeSendAtDate(referenceDate, fakeBroadcastWindow);
+    const response = await sendEmail(
+      sendGridApiKey as string,
+      'example@example.com',
+      'example@example.com',
+      'example@example.com', // replyTo
+      'Test subject line',
+      'Test <strong>html</strong> body',
+      'Test text body',
+      sendAt,
+    );
+    const data = JSON.parse(response as unknown as string);
+    chai.assert(response);
+    chai.assert(typeof data.send_at === "number") // we have a unix timestamp for sending
+  });
+
+  it('should send email with invalid sendAt: past', async function () {
+    const config = await initConfig();
+    const { sendGridApiKey } = config as AppConfig;
+    const referenceDate = new Date();
+    const fakeBroadcastWindow = -10;
+    const sendAt = makeSendAtDate(referenceDate, fakeBroadcastWindow);
+    const response = await sendEmail(
+      sendGridApiKey as string,
+      'example@example.com',
+      'example@example.com',
+      'example@example.com', // replyTo
+      'Test subject line',
+      'Test <strong>html</strong> body',
+      'Test text body',
+      sendAt,
+    );
+    const data = JSON.parse(response as unknown as string);
+    chai.assert(response);
+    chai.assert(typeof data.send_at === "undefined") // when not present it means send immediately
+  });
+
+  it('should send email with invalid sendAt: too far in future', async function () {
+    const config = await initConfig();
+    const { sendGridApiKey } = config as AppConfig;
+    const referenceDate = new Date();
+    const fakeBroadcastWindow = 24 * 10;
+    const sendAt = makeSendAtDate(referenceDate, fakeBroadcastWindow);
+    const response = await sendEmail(
+      sendGridApiKey as string,
+      'example@example.com',
+      'example@example.com',
+      'example@example.com', // replyTo
+      'Test subject line',
+      'Test <strong>html</strong> body',
+      'Test text body',
+      sendAt,
+    );
+    const data = JSON.parse(response as unknown as string);
+    chai.assert(response);
+    chai.assert(typeof data.send_at === 'number'); // it still sends at furthest future time possible
+  });
+
+  it('normalizes Nepali mobile numbers', function () {
+    chai.assert.equal(normalizeNepaliPhone('+977-9841234567'), '9841234567');
+    chai.assert.equal(normalizeNepaliPhone('9779801234567'), '9801234567');
+    chai.assert.equal(normalizeNepaliPhone('09761234567'), '9761234567');
+    chai.assert.equal(normalizeNepaliPhone('014412345'), null);
+    chai.assert.equal(normalizeNepaliPhone('+15555555555'), null);
+  });
+
+  it('should send sms', async function () {
+    const config = await initConfig();
+    const { sparrowSmsToken, smsFromIdentity } = config as AppConfig;
+    const response = await sendSms(
+      sparrowSmsToken as string,
+      '+977 984-1234567',
+      smsFromIdentity as string,
+      'Test message body.',
+      new Date(),
+    );
+    chai.assert.equal(response.to, '9841234567');
+    chai.assert.equal(response.body, 'Test message body.');
+  });
+
+  it('sends sms immediately when sendAt is in the future', async function () {
+    const config = await initConfig();
+    const { sparrowSmsToken, smsFromIdentity } = config as AppConfig;
+    const sendAt = makeSendAtDate(new Date(), 24);
+    const response = await sendSms(
+      sparrowSmsToken as string, '9801234567', smsFromIdentity as string, 'Test message body.', sendAt,
+    );
+    chai.assert.equal(response.to, '9801234567');
+  });
+
+  it('refuses to send sms to an invalid number', async function () {
+    const config = await initConfig();
+    const { sparrowSmsToken, smsFromIdentity } = config as AppConfig;
+    let failed = false;
+    try {
+      await sendSms(sparrowSmsToken as string, '12345', smsFromIdentity as string, 'body', undefined);
+    } catch {
+      failed = true;
+    }
+    chai.assert(failed);
+  });
+
+  it('loads a template', async function () {
+    const { templateRepository } = app.repositories;
+    const expectedOutput = '[Dummy Name - Request #1234]: A New Service Request Has Been Submitted\n'
+    const channel = 'email';
+    const name = 'service-request-new-staff-user';
+    const type = 'subject';
+    const templateContext = {
+      appName: 'Nepal Civic',
+      appRequestUrl: 'https://dummy.url',
+      serviceRequestStatus: 'dummy-status',
+      serviceRequestPublicId: '1234',
+      jurisdictionId: '1234567890',
+      jurisdictionName: 'Dummy Name',
+      jurisdictionEmail: 'dummy@example.com',
+      jurisdictionReplyToServiceRequestEnabled: false,
+      recipientName: 'Dummy Name',
+      messageType: 'workflow'
+    } as TemplateConfigContextAttributes;
+    const response = await loadTemplate(
+      templateContext.jurisdictionId,
+      channel,
+      name,
+      type,
+      templateContext,
+      templateRepository,
+    );
+    chai.assert(new String(response).valueOf().startsWith(new String(expectedOutput).valueOf()));
+  });
+
+  it('loads a custom template subject for a jurisdiction', async function () {
+    const { templateRepository } = app.repositories;
+    const content = 'The content for the custom template';
+    const jurisdictionId = testData.jurisdictions[0].id;
+    const channel = 'email';
+    const name = 'service-request-new-staff-user';
+    const type = 'subject';
+    const customTemplate = await templateRepository.create({ jurisdictionId, channel, name, type, content });
+    const templateContext = {
+      appName: 'Nepal Civic',
+      appRequestUrl: 'https://dummy.url',
+      serviceRequestStatus: 'dummy-status',
+      serviceRequestPublicId: '1234',
+      jurisdictionId: jurisdictionId,
+      jurisdictionName: 'Dummy Name',
+      jurisdictionEmail: 'dummy@example.com',
+      jurisdictionReplyToServiceRequestEnabled: false,
+      recipientName: 'Dummy Name',
+      messageType: 'workflow'
+    } as TemplateConfigContextAttributes;
+    const response = await loadTemplate(jurisdictionId, channel, name, type, templateContext, templateRepository);
+    chai.assert.equal(customTemplate.content, response);
+  });
+
+  it('loads a custom template body for a jurisdiction', async function () {
+    const { templateRepository } = app.repositories;
+    const content = 'The content for the custom template';
+    const jurisdictionId = testData.jurisdictions[0].id;
+    const channel = 'email';
+    const name = 'cx-survey-public-user';
+    const type = 'body';
+    const customTemplate = await templateRepository.create({ jurisdictionId, channel, name, type, content });
+    const templateContext = {
+      appName: 'Nepal Civic',
+      appRequestUrl: 'https://dummy.url',
+      serviceRequestStatus: 'dummy-status',
+      serviceRequestPublicId: '1234',
+      jurisdictionId: jurisdictionId,
+      jurisdictionName: 'Dummy Name',
+      jurisdictionEmail: 'dummy@example.com',
+      jurisdictionReplyToServiceRequestEnabled: false,
+      recipientName: 'Dummy Name',
+      messageType: 'workflow'
+    } as TemplateConfigContextAttributes;
+    const response = await loadTemplate(jurisdictionId, channel, name, type, templateContext, templateRepository);
+    chai.assert.equal(customTemplate.content, response);
+  });
+
+  it('dispatch a message for a public user', async function () {
+    const {
+      serviceRequestRepository,
+      communicationRepository,
+      emailStatusRepository,
+      jurisdictionRepository,
+      templateRepository
+    } = app.repositories;
+    const {
+      sendGridApiKey,
+      sendGridFromEmail,
+      appName,
+      appClientUrl,
+      appClientRequestsPath,
+      sparrowSmsToken,
+      smsFromIdentity,
+      inboundEmailDomain
+    } = app.config;
+    const jurisdictionId = testData.jurisdictions[0].id;
+    const [serviceRequests, _count] = await serviceRequestRepository.findAll(jurisdictionId);
+    const jurisdiction = await jurisdictionRepository.findOne(jurisdictionId);
+    const { workflowBroadcastWindow } = jurisdiction;
+    const replyToEmail = getReplyToEmail(null, jurisdiction, inboundEmailDomain, sendGridFromEmail);
+    const sendFromEmail = getSendFromEmail(jurisdiction, sendGridFromEmail);
+    const sendFromPhone = getSendFromPhone(jurisdiction, smsFromIdentity);
+    const serviceRequest = serviceRequests[0];
+    const referenceDate = SERVICE_REQUEST_CLOSED_STATES.includes(serviceRequest.status)
+      ? serviceRequest.closeDate
+      : new Date();
+    const sendAt = makeSendAtDate(referenceDate, workflowBroadcastWindow);
+    const dispatchConfig = {
+      channel: setDispatchChannel(serviceRequest.channel, jurisdiction.preferredBroadcastChannel),
+      type: 'workflow',
+      sendGridApiKey: sendGridApiKey as string,
+      toEmail: serviceRequest.email as string,
+      fromEmail: sendFromEmail as string,
+      replyToEmail: replyToEmail as string,
+      sparrowSmsToken: sparrowSmsToken as string,
+      fromPhone: sendFromPhone as string,
+      toPhone: serviceRequest.phone as string,
+      sendAt,
+      serviceRequestId: serviceRequest.id,
+    }
+    const templateConfig = {
+      name: 'service-request-new-public-user' as CommunicationTemplateNames,
+      context: {
+        appName,
+        appRequestUrl: makeRequestURL(appClientUrl, appClientRequestsPath, serviceRequest.id),
+        serviceRequestStatus: serviceRequest.status,
+        serviceRequestPublicId: '1234',
+        jurisdictionId: '1234567890',
+        jurisdictionName: 'dummy-name',
+        jurisdictionEmail: 'dummy@example.com',
+        jurisdictionReplyToServiceRequestEnabled: false,
+        recipientName: serviceRequest.displayName as string,
+        messageType: 'workflow'
+      } as TemplateConfigContextAttributes
+    }
+    if (serviceRequest.channel) {
+      const record = await dispatchMessage(
+        dispatchConfig, templateConfig, communicationRepository, emailStatusRepository, templateRepository
+      );
+      chai.assert(record);
+    } else {
+      // TODO: Need to do this check correctly
+      // chai.expect(
+      //     async () => await dispatchMessage(dispatchConfig, templateConfig, Communication, EmailStatus)
+      // ).to.throw();
+    }
+  });
+
+  it('dispatch a message for a staff user', async function () {
+    const {
+      staffUserRepository,
+      communicationRepository,
+      emailStatusRepository,
+      jurisdictionRepository,
+      templateRepository
+    } = app.repositories;
+    const {
+      sendGridApiKey,
+      sendGridFromEmail,
+      appName,
+      appClientUrl,
+      appClientRequestsPath,
+      sparrowSmsToken,
+      smsFromIdentity,
+      inboundEmailDomain
+    } = app.config;
+    const jurisdictionId = testData.jurisdictions[0].id;
+    const [staffUsers, _staffUsersCount] = await staffUserRepository.findAll(jurisdictionId);
+    const jurisdiction = await jurisdictionRepository.findOne(jurisdictionId);
+    const replyToEmail = getReplyToEmail(null, jurisdiction, inboundEmailDomain, sendGridFromEmail);
+    const sendFromEmail = getSendFromEmail(jurisdiction, sendGridFromEmail);
+    const sendFromPhone = getSendFromPhone(jurisdiction, smsFromIdentity);
+    const admins = _.filter(staffUsers, { isAdmin: true });
+    const admin = admins[0] as StaffUserAttributes;
+    const sendAt = new Date();
+    const dispatchConfig = {
+      channel: 'email',
+      type: 'workflow',
+      sendGridApiKey: sendGridApiKey as string,
+      toEmail: admin.email as string,
+      fromEmail: sendFromEmail as string,
+      replyToEmail: replyToEmail as string,
+      sparrowSmsToken: sparrowSmsToken as string,
+      fromPhone: sendFromPhone as string,
+      toPhone: '',
+      sendAt,
+    }
+    const templateConfig = {
+      name: 'service-request-new-staff-user' as CommunicationTemplateNames,
+      context: {
+        appName,
+        appRequestUrl: makeRequestURL(appClientUrl, appClientRequestsPath, ''),
+        serviceRequestStatus: 'dummy',
+        serviceRequestPublicId: '1234',
+        jurisdictionId: '1234567890',
+        jurisdictionName: 'dummy-name',
+        jurisdictionEmail: 'dummy@example.com',
+        jurisdictionReplyToServiceRequestEnabled: false,
+        recipientName: admin.displayName as string,
+        messageType: 'workflow'
+      } as TemplateConfigContextAttributes
+    }
+    const record = await dispatchMessage(
+      dispatchConfig, templateConfig, communicationRepository, emailStatusRepository, templateRepository
+    );
+    chai.assert(record);
+  });
+
+  it('dispatches a service request comment notification', async function () {
+    const outboundMessageService = new OutboundMessageService(app.repositories, app.config);
+    const { serviceRequestRepository } = app.repositories;
+    const jurisdiction = testData.jurisdictions[0];
+    const serviceRequests = _.filter(testData.serviceRequests, { jurisdictionId: jurisdiction.id });
+    const serviceRequest = serviceRequests[0];
+    const data = { comment: "hey you", addBy: "__SUBMITTER__" };
+    const [record, comment] = await serviceRequestRepository.createComment(
+      jurisdiction.id, serviceRequest.id, data
+    );
+    await outboundMessageService.dispatchServiceRequestComment(
+      jurisdiction, record, { serviceRequestCommentId: comment.id }
+    );
+  });
+
+  it('cannot dispatch a cx survey notification when surveys are disabled', async function () {
+    const outboundMessageService = new OutboundMessageService(app.repositories, app.config);
+    const { serviceRequestRepository, jurisdictionRepository } = app.repositories;
+    const jurisdiction = await jurisdictionRepository.findOne(testData.jurisdictions[0].id);
+    const serviceRequests = _.filter(testData.serviceRequests, { jurisdictionId: jurisdiction.id });
+    const serviceRequest = await serviceRequestRepository.findOne(jurisdiction.id, serviceRequests[0].id);
+    const record = await outboundMessageService.dispatchCXSurvey(jurisdiction, serviceRequest);
+    chai.assert.equal(record, null);
+    chai.assert.equal(jurisdiction.cxSurveyEnabled, false);
+  });
+
+  it('cannot dispatch a cx survey notification when surveys are enabled but there is no survey url',
+    async function () {
+      const outboundMessageService = new OutboundMessageService(app.repositories, app.config);
+      const { serviceRequestRepository, jurisdictionRepository } = app.repositories;
+      let jurisdiction = await jurisdictionRepository.findOne(testData.jurisdictions[0].id);
+      jurisdiction = await jurisdictionRepository.update(jurisdiction.id, { cxSurveyEnabled: true })
+      const serviceRequests = _.filter(testData.serviceRequests, { jurisdictionId: jurisdiction.id });
+      const serviceRequest = await serviceRequestRepository.findOne(jurisdiction.id, serviceRequests[0].id);
+      const record = await outboundMessageService.dispatchCXSurvey(jurisdiction, serviceRequest);
+      chai.assert.equal(record, null);
+      chai.assert.equal(jurisdiction.cxSurveyEnabled, true);
+      chai.assert.equal(jurisdiction.cxSurveyUrl, null);
+    });
+
+  it(`cannot dispatch a cx survey notification when surveys are enabled, survey url exists,
+    but service request status is not equal to cxSurveyTriggerStatus`,
+    async function () {
+      const outboundMessageService = new OutboundMessageService(app.repositories, app.config);
+      const { serviceRequestRepository, jurisdictionRepository } = app.repositories;
+      const surveyUrl = 'https://example.com/cx-survey';
+      const serviceRequestStatus = 'pending';
+      let jurisdiction = await jurisdictionRepository.findOne(testData.jurisdictions[0].id);
+      jurisdiction = await jurisdictionRepository.update(
+        jurisdiction.id, { cxSurveyEnabled: true, cxSurveyUrl: surveyUrl }
+      );
+      const serviceRequests = _.filter(testData.serviceRequests, { jurisdictionId: jurisdiction.id });
+      let serviceRequest = await serviceRequestRepository.findOne(jurisdiction.id, serviceRequests[0].id);
+      serviceRequest = await serviceRequestRepository.update(
+        jurisdiction.id, serviceRequest.id, { status: serviceRequestStatus }
+      );
+      const record = await outboundMessageService.dispatchCXSurvey(jurisdiction, serviceRequest);
+      chai.assert.equal(record, null);
+      chai.assert.equal(jurisdiction.cxSurveyEnabled, true);
+      chai.assert.equal(jurisdiction.cxSurveyUrl, surveyUrl);
+      chai.assert.notEqual(jurisdiction.cxSurveyTriggerStatus, serviceRequest.status);
+      chai.assert.equal(jurisdiction.cxSurveyTriggerStatus, 'resolved');
+    });
+
+  it('can dispatch a cx survey notification with default trigger status', async function () {
+    const outboundMessageService = new OutboundMessageService(app.repositories, app.config);
+    const { serviceRequestRepository, jurisdictionRepository } = app.repositories;
+    const surveyUrl = 'https://example.com/cx-survey';
+    const serviceRequestStatus = 'resolved';
+    let jurisdiction = await jurisdictionRepository.findOne(testData.jurisdictions[0].id);
+    jurisdiction = await jurisdictionRepository.update(
+      jurisdiction.id, { cxSurveyEnabled: true, cxSurveyUrl: surveyUrl }
+    );
+    const serviceRequests = _.filter(testData.serviceRequests, { jurisdictionId: jurisdiction.id });
+    let serviceRequest = await serviceRequestRepository.findOne(jurisdiction.id, serviceRequests[0].id);
+    serviceRequest = await serviceRequestRepository.update(
+      jurisdiction.id, serviceRequest.id, { status: serviceRequestStatus }
+    );
+    const record = await outboundMessageService.dispatchCXSurvey(
+      jurisdiction, serviceRequest
+    ) as CommunicationAttributes;
+    chai.assert.equal(record.accepted, true);
+    chai.assert.equal(record.delivered, true);
+    chai.assert.equal(record.dispatched, true);
+    chai.assert.equal(jurisdiction.cxSurveyEnabled, true);
+    chai.assert.equal(jurisdiction.cxSurveyUrl, surveyUrl);
+    chai.assert.equal(jurisdiction.cxSurveyTriggerStatus, serviceRequest.status);
+    chai.assert.equal(jurisdiction.cxSurveyTriggerStatus, 'resolved');
+  });
+
+  it('can dispatch a cx survey notification with a custom trigger status', async function () {
+    const outboundMessageService = new OutboundMessageService(app.repositories, app.config);
+    const { serviceRequestRepository, jurisdictionRepository } = app.repositories;
+    const surveyUrl = 'https://example.com/cx-survey';
+    const serviceRequestStatus = 'pending';
+    let jurisdiction = await jurisdictionRepository.findOne(testData.jurisdictions[0].id);
+    jurisdiction = await jurisdictionRepository.update(
+      jurisdiction.id,
+      { cxSurveyEnabled: true, cxSurveyUrl: surveyUrl, cxSurveyTriggerStatus: serviceRequestStatus }
+    );
+    const serviceRequests = _.filter(testData.serviceRequests, { jurisdictionId: jurisdiction.id });
+    let serviceRequest = await serviceRequestRepository.findOne(jurisdiction.id, serviceRequests[0].id);
+    serviceRequest = await serviceRequestRepository.update(
+      jurisdiction.id, serviceRequest.id, { status: serviceRequestStatus }
+    );
+    const record = await outboundMessageService.dispatchCXSurvey(
+      jurisdiction, serviceRequest
+    ) as CommunicationAttributes;
+    chai.assert.equal(record.accepted, true);
+    chai.assert.equal(record.delivered, true);
+    chai.assert.equal(record.dispatched, true);
+    chai.assert.equal(jurisdiction.cxSurveyEnabled, true);
+    chai.assert.equal(jurisdiction.cxSurveyUrl, surveyUrl);
+    chai.assert.equal(jurisdiction.cxSurveyTriggerStatus, serviceRequest.status);
+    chai.assert.equal(jurisdiction.cxSurveyTriggerStatus, 'pending');
+  });
+
+  it('cannot dispatch a cx survey notification when the submitter is anonymous', async function () {
+    const outboundMessageService = new OutboundMessageService(app.repositories, app.config);
+    const { serviceRequestRepository, jurisdictionRepository } = app.repositories;
+    const surveyUrl = 'https://example.com/cx-survey';
+    const serviceRequestStatus = 'resolved';
+    let jurisdiction = await jurisdictionRepository.findOne(testData.jurisdictions[0].id);
+    jurisdiction = await jurisdictionRepository.update(
+      jurisdiction.id, { cxSurveyEnabled: true, cxSurveyUrl: surveyUrl }
+    );
+    const serviceRequests = _.filter(testData.serviceRequests, { jurisdictionId: jurisdiction.id });
+    let serviceRequest = await serviceRequestRepository.findOne(jurisdiction.id, serviceRequests[0].id);
+    serviceRequest = await serviceRequestRepository.update(
+      jurisdiction.id, serviceRequest.id, { status: serviceRequestStatus, email: '', phone: '' }
+    );
+    const record = await outboundMessageService.dispatchCXSurvey(
+      jurisdiction, serviceRequest
+    ) as CommunicationAttributes;
+    chai.assert.equal(record, null);
+    chai.assert.equal(serviceRequest.email, null);
+    chai.assert.equal(serviceRequest.phone, null);
+  });
+
+});

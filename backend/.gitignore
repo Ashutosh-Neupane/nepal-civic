@@ -1,0 +1,39 @@
+# Stuff
+.DS_Store
+
+# Logs
+npm-debug.log*
+
+# Dependency directory
+node_modules
+
+# Optional npm cache directory
+.npm
+
+# Optional REPL history
+.node_repl_history
+
+# Editors
+.idea
+.vscode
+
+# compile dir
+lib
+
+# test and coverage
+.nyc_output
+coverage
+coverage.json
+
+# app logs
+*.log
+
+.env
+
+# local qa files
+client.http
+data.http
+
+# dummy data generator configuration
+/dummy-*.json
+!/dummy-data-template.json
