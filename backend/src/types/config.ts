@@ -1,0 +1,47 @@
+import type { DatabaseEngine, MigrationEngine } from '.';
+import { PluginRegistry } from './registry';
+
+export interface AppConfig {
+  [x: string]: unknown;
+  env: string;
+  databaseUrl: string;
+  sendGridApiKey: string;
+  sendGridFromEmail: string;
+  sendGridSignedWebhookVerificationKey: string;
+  sparrowSmsToken: string;
+  smsFromIdentity: string;
+  inboundSmsSecret: string;
+  sentryDsn: string;
+  sentryEnvironment: string;
+  testToEmail: string;
+  testToPhone: string;
+  appPort: number;
+  appName: string;
+  appClientUrl: string;
+  appClientRequestsPath: string;
+  storageBucket: string;
+  storageRegion: string;
+  storageSSL: boolean;
+  storagePort: number;
+  storageEndpoint: string;
+  storageAccessKey: string;
+  storageSecretKey: string;
+  storageSignedGetExpiry: number;
+  inboundEmailDomain: string;
+  communicationsToConsole: string;
+  captchaEnabled: boolean;
+  reCaptchaSecretKey: string;
+  storageDriver: 's3' | 'local';
+  storageLocalDir: string;
+  appPublicUrl: string;
+  authJwtSecret: string;
+  authTokenTtlHours: number;
+  otpTtlMinutes: number;
+  otpExposeInResponse: boolean;
+  enforceAuthorization: boolean;
+  escalationIntervalMinutes: number;
+  resolvedAutoCloseDays: number;
+  plugins?: PluginRegistry;
+  database?: DatabaseEngine;
+  migrator?: MigrationEngine;
+}
