@@ -1,0 +1,45 @@
+import chai from 'chai';
+import chaiHttp from 'chai-http';
+import { Application } from 'express';
+import { createApp } from '../src/index';
+
+chai.use(chaiHttp);
+
+describe('Check responses in common error scenarios', function () {
+    let app: Application;
+
+    before(async function () {
+        process.env.CONFIG_MODULE_PATH = './test/fixtures/custom-config-broken-repository.ts';
+        app = await createApp();
+    })
+
+    after(async function () {
+        process.env.CONFIG_MODULE_PATH = undefined;
+    })
+
+    it('should return 404 not found for routes that do not exist', async function () {
+        const res = await chai.request(app).get('/this-route-does-not-exist');
+        chai.assert.equal(res.status, 404);
+    });
+
+    it('should return 500 internal server error', async function () {
+        const res = await chai.request(app).get('/jurisdictions/not-a-real-jurisdiction-id');
+        chai.assert.equal(res.status, 500);
+    });
+
+    it('should return 403 error when no jurisdictionId query param', async function () {
+        const res = await chai.request(app).get('/services');
+        chai.assert.equal(res.status, 403);
+    });
+
+    it.skip('should return 403 error when no jurisdiction_id query param', async function () {
+        const res = await chai.request(app).get('/open311/services.json');
+        chai.assert.equal(res.status, 403);
+    });
+
+    it('should return 501 (not 403) error for a route exluded from required jurisdiction_id param', async function () {
+        const res = await chai.request(app).get('/open311/v2/discovery');
+        chai.assert.equal(res.status, 501);
+    });
+
+});
